@@ -31,7 +31,7 @@ License: Revised BSD License, see LICENSE.TXT file include in the project
 
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE CONSTANTS & TYPES -------------------------------------------- */
-#define TX_START_DELAY          1500    /* microseconds */
+/* Note: TX_START_DELAY moved to jitqueue.h (public constant) */
 #define TX_MARGIN_DELAY         1000    /* Packet overlap margin in microseconds */
 #define TX_JIT_DELAY            40000   /* Pre-delay to program packet for TX in microseconds */
 #define TX_MAX_ADVANCE_DELAY    ((JIT_NUM_BEACON_IN_QUEUE + 1) * 128 * 1E6) /* Maximum advance delay accepted for a TX packet, compared to current time */
@@ -43,6 +43,12 @@ License: Revised BSD License, see LICENSE.TXT file include in the project
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE VARIABLES (GLOBAL) ------------------------------------------- */
 static pthread_mutex_t mx_jit_queue = PTHREAD_MUTEX_INITIALIZER; /* control access to JIT queue */
+
+/* External variables for active transmission tracking (from lora_pkt_fwd.c) */
+extern pthread_mutex_t mx_tx_state;
+extern uint32_t last_tx_start_time[];
+extern uint32_t last_tx_end_time[];
+extern bool tx_active[];
 
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE FUNCTIONS DEFINITION ----------------------------------------- */
@@ -292,6 +298,40 @@ enum jit_error_e jit_enqueue(struct jit_queue_s *queue, uint32_t time_us, struct
             return err_collision;
         }
     }
+
+    /* Check criteria_4: does this packet collide with active transmission?
+     * Even if queue is empty, hardware may still be transmitting a dequeued packet
+     * This prevents TX_EMITTING errors by catching collisions at enqueue time
+     */
+    pthread_mutex_lock(&mx_tx_state);
+    for (i = 0; i < LGW_RF_CHAIN_NB; i++) {
+        if (tx_active[i]) {
+            /* Create virtual packet representing active transmission for collision test */
+            uint32_t active_post_delay = last_tx_end_time[i] - last_tx_start_time[i];
+            if (jit_collision_test(packet->count_us, packet_pre_delay, packet_post_delay,
+                                   last_tx_start_time[i], TX_START_DELAY + TX_JIT_DELAY,
+                                   active_post_delay) == true) {
+                MSG_PRINTF(DEBUG_JIT_ERROR, "WARNING: Packet REJECTED, collision with active TX on rf_chain %d (current=%u, packet=%u, tx_end=%u, type=%d)\n",
+                          i, time_us, packet->count_us, last_tx_end_time[i], pkt_type);
+
+                /* For Class A packets, this is a hard error - cannot reschedule */
+                if (pkt_type == JIT_PKT_TYPE_DOWNLINK_CLASS_A) {
+                    pthread_mutex_unlock(&mx_tx_state);
+                    pthread_mutex_unlock(&mx_jit_queue);
+                    return JIT_ERROR_COLLISION_PACKET;
+                }
+
+                /* For Class C, try to reschedule after active TX completes */
+                uint32_t old_timestamp = packet->count_us;
+                packet->count_us = last_tx_end_time[i] + TX_JIT_DELAY + TX_MARGIN_DELAY;
+                MSG("INFO: Rescheduling Class C packet (RF chain %d busy) - old timestamp=%u, new timestamp=%u (delay=%u us)\n",
+                    i, old_timestamp, packet->count_us, packet->count_us - old_timestamp);
+                /* Note: packet will be enqueued with new timestamp, collision checks already passed for earlier time */
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&mx_tx_state);
 
     /* Finally enqueue it */
     /* Insert packet at the end of the queue */

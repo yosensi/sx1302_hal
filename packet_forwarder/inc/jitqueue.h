@@ -31,6 +31,8 @@ License: Revised BSD License, see LICENSE.TXT file include in the project
 #define JIT_QUEUE_MAX           32  /* Maximum number of packets to be stored in JiT queue */
 #define JIT_NUM_BEACON_IN_QUEUE 3   /* Number of beacons to be loaded in JiT queue at any time */
 
+#define TX_START_DELAY          1500    /* TX start delay in microseconds - hardware startup time */
+
 /* -------------------------------------------------------------------------- */
 /* --- PUBLIC TYPES --------------------------------------------------------- */
 

@@ -241,6 +241,13 @@ static uint32_t autoquit_threshold = 0; /* enable auto-quit after a number of no
 /* Just In Time TX scheduling */
 static struct jit_queue_s jit_queue[LGW_RF_CHAIN_NB];
 
+/* Active transmission tracking (fix for TX_EMITTING collision blind spot) */
+/* Note: Non-static to allow access from jitqueue.c for criteria_4 collision check */
+pthread_mutex_t mx_tx_state = PTHREAD_MUTEX_INITIALIZER;
+uint32_t last_tx_start_time[LGW_RF_CHAIN_NB] = {0};  /* Per RF chain */
+uint32_t last_tx_end_time[LGW_RF_CHAIN_NB] = {0};    /* Per RF chain */
+bool tx_active[LGW_RF_CHAIN_NB] = {false};           /* Is transmission active? */
+
 /* Gateway specificities */
 static int8_t antenna_gain = 0;
 
@@ -3258,6 +3265,17 @@ void thread_jit(void) {
             pthread_mutex_lock(&mx_concent);
             lgw_get_instcnt(&current_concentrator_time);
             pthread_mutex_unlock(&mx_concent);
+
+            /* Check if active transmission has completed on this RF chain */
+            pthread_mutex_lock(&mx_tx_state);
+            if (tx_active[i]) {
+                if ((int32_t)(current_concentrator_time - last_tx_end_time[i]) > 0) {
+                    tx_active[i] = false;
+                    MSG_DEBUG(DEBUG_JIT, "TX completed on rf_chain %d at %u\n", i, current_concentrator_time);
+                }
+            }
+            pthread_mutex_unlock(&mx_tx_state);
+
             jit_result = jit_peek(&jit_queue[i], current_concentrator_time, &pkt_index);
             if (jit_result == JIT_ERROR_OK) {
                 if (pkt_index > -1) {
@@ -3288,6 +3306,13 @@ void thread_jit(void) {
                             if (tx_status == TX_EMITTING) {
                                 MSG("ERROR: concentrator is currently emitting on rf_chain %d\n", i);
                                 print_tx_status(tx_status);
+
+                                /* IMPORTANT: This shouldn't happen with proper tracking, but if it does,
+                                 * assume transmission is stuck and clear the flag */
+                                pthread_mutex_lock(&mx_tx_state);
+                                tx_active[i] = false;
+                                pthread_mutex_unlock(&mx_tx_state);
+
                                 continue;
                             } else if (tx_status == TX_SCHEDULED) {
                                 MSG("WARNING: a downlink was already scheduled on rf_chain %d, overwritting it...\n", i);
@@ -3318,6 +3343,17 @@ void thread_jit(void) {
                             meas_nb_tx_ok += 1;
                             pthread_mutex_unlock(&mx_meas_dw);
                             MSG_DEBUG(DEBUG_PKT_FWD, "lgw_send done on rf_chain %d: count_us=%u\n", i, pkt.count_us);
+
+                            /* Record transmission start and estimated end time for collision detection */
+                            pthread_mutex_lock(&mx_tx_state);
+                            last_tx_start_time[i] = pkt.count_us;
+                            uint32_t airtime_us = lgw_time_on_air(&pkt) * 1000;  /* Convert ms to us */
+                            last_tx_end_time[i] = pkt.count_us + airtime_us + TX_START_DELAY;
+                            tx_active[i] = true;
+                            pthread_mutex_unlock(&mx_tx_state);
+
+                            MSG_DEBUG(DEBUG_JIT, "TX started on rf_chain %d: start=%u, end=%u, airtime=%u us\n",
+                                      i, pkt.count_us, last_tx_end_time[i], airtime_us);
                         }
                     } else {
                         MSG("ERROR: jit_dequeue failed on rf_chain %d with %d\n", i, jit_result);
