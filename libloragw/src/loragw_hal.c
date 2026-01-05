@@ -205,6 +205,7 @@ FILE * log_file = NULL;
 /* I2C temperature sensor handles */
 static int     ts_fd = -1;
 static uint8_t ts_addr = 0xFF;
+static bool    ts_available = false;
 
 /* I2C AD5338 handles */
 static int     ad_fd = -1;
@@ -1094,12 +1095,13 @@ int lgw_start(void) {
 
     if (CONTEXT_COM_TYPE == LGW_COM_SPI) {
         /* Find the temperature sensor on the known supported ports */
+        ts_available = false;
         for (i = 0; i < (int)(sizeof I2C_PORT_TEMP_SENSOR); i++) {
             ts_addr = I2C_PORT_TEMP_SENSOR[i];
             err = i2c_linuxdev_open(I2C_DEVICE, ts_addr, &ts_fd);
             if (err != LGW_I2C_SUCCESS) {
-                printf("ERROR: failed to open I2C for temperature sensor on port 0x%02X\n", ts_addr);
-                return LGW_HAL_ERROR;
+                printf("INFO: failed to open I2C for temperature sensor on port 0x%02X\n", ts_addr);
+                continue;
             }
 
             err = stts751_configure(ts_fd, ts_addr);
@@ -1109,12 +1111,14 @@ int lgw_start(void) {
                 ts_fd = -1;
             } else {
                 printf("INFO: found temperature sensor on port 0x%02X\n", ts_addr);
+                ts_available = true;
                 break;
             }
         }
-        if (i == sizeof I2C_PORT_TEMP_SENSOR) {
-            printf("ERROR: no temperature sensor found.\n");
-            return LGW_HAL_ERROR;
+        if (!ts_available) {
+            printf("WARNING: no temperature sensor found. RSSI temperature compensation will use fixed reference (20C).\n");
+            ts_fd = -1;
+            ts_addr = 0xFF;
         }
 
         /* Configure ADC AD338R for full duplex (CN490 reference design) */
@@ -1287,10 +1291,15 @@ int lgw_receive(uint8_t max_pkt, struct lgw_pkt_rx_s *pkt_data) {
     }
 
     /* Apply RSSI temperature compensation */
-    res = lgw_get_temperature(&current_temperature);
-    if (res != LGW_I2C_SUCCESS) {
-        printf("ERROR: failed to get current temperature\n");
-        return LGW_HAL_ERROR;
+    if (ts_available) {
+        res = lgw_get_temperature(&current_temperature);
+        if (res != LGW_I2C_SUCCESS) {
+            printf("ERROR: failed to get current temperature from available sensor\n");
+            return LGW_HAL_ERROR;
+        }
+    } else {
+        /* No temperature sensor available, use fixed reference temperature */
+        current_temperature = 20.0;
     }
 
     /* Iterate on the RX buffer to get parsed packets */
@@ -1597,7 +1606,13 @@ int lgw_get_temperature(float* temperature) {
 
     switch (CONTEXT_COM_TYPE) {
         case LGW_COM_SPI:
-            err = stts751_get_temperature(ts_fd, ts_addr, temperature);
+            if (ts_available) {
+                err = stts751_get_temperature(ts_fd, ts_addr, temperature);
+            } else {
+                /* No temperature sensor available, return fixed reference temperature */
+                *temperature = 20.0;
+                err = LGW_I2C_SUCCESS;
+            }
             break;
         case LGW_COM_USB:
             err = lgw_com_get_temperature(temperature);
